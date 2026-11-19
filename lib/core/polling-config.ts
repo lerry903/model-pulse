@@ -1,6 +1,5 @@
 const DEFAULT_INTERVAL_SECONDS = 60;
 const MIN_INTERVAL_SECONDS = 15;
-const MAX_INTERVAL_SECONDS = 600;
 
 // 官方状态检查默认间隔(5 分钟)
 const DEFAULT_OFFICIAL_STATUS_INTERVAL_SECONDS = 300;
@@ -15,7 +14,7 @@ const MAX_CHECK_CONCURRENCY = 20;
 function parseIntervalSeconds() {
   const raw = process.env.CHECK_POLL_INTERVAL_SECONDS;
   const parsed = Number(raw);
-  if (Number.isFinite(parsed) && parsed > 0) {
+  if (Number.isSafeInteger(parsed) && parsed > 0 && Number.isSafeInteger(parsed * 1000)) {
     return parsed;
   }
   return DEFAULT_INTERVAL_SECONDS;
@@ -32,7 +31,7 @@ function parseOfficialStatusIntervalSeconds() {
 
 export function getPollingIntervalSeconds() {
   const seconds = parseIntervalSeconds();
-  return Math.max(MIN_INTERVAL_SECONDS, Math.min(MAX_INTERVAL_SECONDS, seconds));
+  return Math.max(MIN_INTERVAL_SECONDS, seconds);
 }
 
 export function getPollingIntervalMs() {

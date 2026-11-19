@@ -11,7 +11,7 @@ export type PollerRole = "leader" | "standby";
  * 扩展 globalThis 类型
  */
 declare global {
-  var __modelPulsePoller: NodeJS.Timeout | undefined;
+  var __modelPulsePoller: (() => void) | undefined;
   var __modelPulsePollerRunning: boolean | undefined;
   var __modelPulseLastPingStartedAt: number | undefined;
   var __modelPulsePollerLeaderTimer: NodeJS.Timeout | undefined;
@@ -22,14 +22,14 @@ declare global {
 /**
  * 获取轮询器定时器
  */
-export function getPollerTimer(): NodeJS.Timeout | undefined {
+export function getPollerTimer(): (() => void) | undefined {
   return globalThis.__modelPulsePoller;
 }
 
 /**
  * 设置轮询器定时器
  */
-export function setPollerTimer(timer: NodeJS.Timeout): void {
+export function setPollerTimer(timer: () => void): void {
   globalThis.__modelPulsePoller = timer;
 }
 

@@ -21,7 +21,7 @@
 ### 可选（运行参数）
 
 - `CHECK_NODE_ID`：节点标识（多节点部署必须唯一）
-- `CHECK_POLL_INTERVAL_SECONDS`：检测间隔（15–600 秒）
+- `CHECK_POLL_INTERVAL_SECONDS`：检测间隔（整数秒，最小 15，支持超过 600，例如 `3600`；修改后重启生效）。未设置、非整数或无法安全转换为整数毫秒时使用默认 60 秒；超长间隔会分段等待，避免原生定时器溢出。
 - `CHECK_CONCURRENCY`：并发数（1–20）
 - `OFFICIAL_STATUS_CHECK_INTERVAL_SECONDS`：官方状态轮询间隔（60–3600 秒）
 - `HISTORY_RETENTION_DAYS`：历史保留天数（7–365）

@@ -203,7 +203,7 @@ WHERE provider_id = 'openai' AND model = 'gpt-4o-mini';
 | `SUPABASE_PUBLISHABLE_OR_ANON_KEY` | 是 | - | Supabase 公共访问 Key |
 | `SUPABASE_SERVICE_ROLE_KEY` | 是 | - | Service Role Key（服务端使用，勿暴露） |
 | `CHECK_NODE_ID` | 否 | `local` | 节点身份，多节点选主用 |
-| `CHECK_POLL_INTERVAL_SECONDS` | 否 | `60` | 检测间隔（15–600 秒） |
+| `CHECK_POLL_INTERVAL_SECONDS` | 否 | `60` | 检测间隔（整数秒，最小 15，支持超过 600，例如 `3600`；修改后重启生效） |
 | `CHECK_CONCURRENCY` | 否 | `5` | 最大并发（1–20） |
 | `OFFICIAL_STATUS_CHECK_INTERVAL_SECONDS` | 否 | `300` | 官方状态轮询间隔（60–3600 秒） |
 | `HISTORY_RETENTION_DAYS` | 否 | `30` | 历史保留天数（7–365） |

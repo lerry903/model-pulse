@@ -11,6 +11,7 @@ import {getLastPingStartedAt, getPollerTimer, setLastPingStartedAt, setPollerTim
 import {startOfficialStatusPoller} from "./official-status-poller";
 import {ensurePollerLeadership, isPollerLeader} from "./poller-leadership";
 import type {CheckResult, HealthStatus} from "../types";
+import {setLongInterval} from "../utils/interval";
 
 const POLL_INTERVAL_MS = getPollingIntervalMs();
 const FAILURE_STATUSES: ReadonlySet<HealthStatus> = new Set([
@@ -132,14 +133,17 @@ async function tick() {
 
 // 自动初始化轮询器
 if (!getPollerTimer()) {
-  const firstCheckAt = new Date(Date.now() + POLL_INTERVAL_MS).toISOString();
+  const firstCheckDate = new Date(Date.now() + POLL_INTERVAL_MS);
+  const firstCheckAt = Number.isNaN(firstCheckDate.getTime())
+    ? `${POLL_INTERVAL_MS / 1000} 秒后`
+    : firstCheckDate.toISOString();
   console.log(
     `[model-pulse] 初始化后台轮询器，interval=${POLL_INTERVAL_MS}ms，首次检测预计 ${firstCheckAt}`
   );
   ensurePollerLeadership().catch((error) => {
     console.error("[model-pulse] 初始化主节点选举失败", error);
   });
-  const timer = setInterval(() => {
+  const timer = setLongInterval(() => {
     tick().catch((error) => console.error("[model-pulse] 定时检测失败", error));
   }, POLL_INTERVAL_MS);
   setPollerTimer(timer);

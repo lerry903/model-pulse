@@ -12,6 +12,7 @@ import {useConfigLiveReload} from "@/lib/core/use-config-live-reload";
 import type {AvailabilityPeriod, ProviderTimeline} from "@/lib/types";
 import type {GroupDashboardData} from "@/lib/core/group-data";
 import {cn} from "@/lib/utils";
+import {setLongInterval} from "@/lib/utils/interval";
 
 interface GroupDashboardViewProps {
   groupName: string;
@@ -130,10 +131,9 @@ export function GroupDashboardView({ groupName, initialData }: GroupDashboardVie
     if (!data.pollIntervalMs || data.pollIntervalMs <= 0) {
       return;
     }
-    const timer = window.setInterval(() => {
+    return setLongInterval(() => {
       refresh(undefined, false, true).catch(() => undefined);
     }, data.pollIntervalMs);
-    return () => window.clearInterval(timer);
   }, [data.pollIntervalMs, refresh]);
 
   useEffect(() => {

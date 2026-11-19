@@ -203,7 +203,7 @@ No SQL needed for day-to-day maintenance of models, configs, groups, and notific
 | `SUPABASE_PUBLISHABLE_OR_ANON_KEY` | Yes | - | Supabase publishable / anon key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Yes | - | Service Role Key (server-side only, never expose) |
 | `CHECK_NODE_ID` | No | `local` | Node identity, used for multi-node leader election |
-| `CHECK_POLL_INTERVAL_SECONDS` | No | `60` | Poll interval (15–600s) |
+| `CHECK_POLL_INTERVAL_SECONDS` | No | `60` | Integer poll interval in seconds (minimum 15; supports values above 600, e.g. `3600`; restart after changes) |
 | `CHECK_CONCURRENCY` | No | `5` | Max concurrency (1–20) |
 | `OFFICIAL_STATUS_CHECK_INTERVAL_SECONDS` | No | `300` | Official status poll interval (60–3600s) |
 | `HISTORY_RETENTION_DAYS` | No | `30` | History retention days (7–365) |

@@ -53,6 +53,7 @@ import { UNGROUPED_DISPLAY_NAME } from "@/lib/types";
 import {STATUS_META} from "@/lib/core/status";
 import {cn} from "@/lib/utils";
 import {parseTagList, getTagColorClass} from "@/lib/utils/tag-colors";
+import {setLongInterval} from "@/lib/utils/interval";
 
 interface DashboardViewProps {
   /** 首屏聚合数据，刷新页面时重新向接口拉最新快照 */
@@ -510,10 +511,9 @@ export function DashboardView({ initialData }: DashboardViewProps) {
     if (!data.pollIntervalMs || data.pollIntervalMs <= 0) {
       return;
     }
-    const timer = window.setInterval(() => {
+    return setLongInterval(() => {
       refresh(undefined, false, true).catch(() => undefined);
     }, data.pollIntervalMs);
-    return () => window.clearInterval(timer);
   }, [data.pollIntervalMs, refresh]);
 
   useEffect(() => {
