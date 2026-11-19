@@ -1,0 +1,544 @@
+/**
+ * 统一的 AI SDK 健康检查模块
+ *
+ * 使用 Vercel AI SDK 统一处理多种 AI Provider 的健康检查：
+ * - OpenAI：支持 Chat Completions API (/v1/chat/completions) 和 Responses API (/v1/responses)
+ * - Anthropic：Claude 系列模型
+ * - Gemini：原生 API 或显式 OpenAI 兼容协议
+ *
+ * 核心流程：
+ * 1. 根据显式 API 协议创建对应的 SDK 实例
+ * 2. 发送随机语言挑战，验证模型真实可用性
+ * 3. 通过流式响应获取首个非空 token，测量真实首字延迟（部分端点会
+ *    先吐空流伪造首字时间，只有首个非空增量才算数）
+ * 4. 根据延迟阈值判定健康状态（operational/degraded/failed）
+ *
+ * 特殊支持：
+ * - 推理模型（o1/o3/deepseek-r1 等）的 reasoning 参数
+ * - 自定义请求头和 metadata 注入
+ * - 端点 Ping 延迟测量
+ */
+
+import { streamText } from "ai";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { createGoogle } from "@ai-sdk/google";
+
+import type { ChallengeOutcome, CheckResult, HealthStatus, ProviderConfig } from "../types";
+import { getErrorMessage, getSanitizedErrorDetail } from "../utils";
+import { generateChallenge, validateResponse } from "./challenge";
+import { measureEndpointPing } from "./endpoint-ping";
+
+/* ============================================================================
+ * 常量定义
+ * ============================================================================ */
+
+/** 默认超时时间（毫秒）- 45 秒，兼顾慢速模型的首次响应 */
+const DEFAULT_TIMEOUT_MS = 45_000;
+
+/** 性能降级阈值（毫秒）- 超过此值标记为 degraded 状态 */
+const DEGRADED_THRESHOLD_MS = 6_000;
+
+/** 需要从 metadata 中排除的字段，这些字段会与 streamText 内部参数冲突 */
+const EXCLUDED_METADATA_KEYS = new Set(["model", "prompt", "messages", "abortSignal"]);
+
+/** 用于从完整端点 URL 中提取 baseURL 的正则表达式 */
+const API_PATH_SUFFIX_REGEX = /\/(chat\/completions|responses|messages)\/?$/;
+
+/* ============================================================================
+ * URL 处理工具函数
+ * ============================================================================ */
+
+/**
+ * 从完整端点 URL 中提取 SDK 所需的 baseURL
+ *
+ * AI SDK 需要 baseURL（如 https://api.openai.com/v1），
+ * 而用户配置的往往是完整端点（如 https://api.openai.com/v1/chat/completions）
+ *
+ * @example
+ * deriveBaseURL("https://api.openai.com/v1/chat/completions")
+ * // => "https://api.openai.com/v1"
+ */
+function deriveBaseURL(endpoint: string): string {
+  const url = new URL(endpoint);
+  url.search = "";
+  url.hash = "";
+  url.pathname = url.pathname.replace(API_PATH_SUFFIX_REGEX, "");
+  return url.toString().replace(/\/$/, "");
+}
+
+/**
+ * 将配置端点上的查询参数合并到实际请求 URL 中
+ *
+ * SDK 在内部会基于 baseURL 重新拼接请求地址，导致配置在 endpoint 上的查询参数丢失。
+ * 这里统一把配置参数补回去，避免出现“配置了但请求没带上”的破事。
+ */
+function mergeEndpointQueryParams(
+  input: RequestInfo | URL,
+  endpoint: string
+): RequestInfo | URL {
+  let requestUrl: URL;
+
+  try {
+    requestUrl = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  } catch {
+    return input;
+  }
+
+  let endpointUrl: URL;
+  try {
+    endpointUrl = new URL(endpoint);
+  } catch {
+    return input;
+  }
+
+  if (!endpointUrl.search) {
+    return input;
+  }
+
+  for (const key of new Set(endpointUrl.searchParams.keys())) {
+    requestUrl.searchParams.delete(key);
+    for (const value of endpointUrl.searchParams.getAll(key)) {
+      requestUrl.searchParams.append(key, value);
+    }
+  }
+
+  if (input instanceof Request) {
+    return new Request(requestUrl, input);
+  }
+
+  return requestUrl;
+}
+
+/* ============================================================================
+ * 推理模型支持
+ * ============================================================================ */
+
+/**
+ * 推理强度级别
+ *
+ * 对应 AI SDK 顶层 `reasoning` 选项（provider-agnostic）：
+ * - low：快速推理，token 消耗少
+ * - medium：平衡模式（推理模型默认值）
+ * - high：深度推理，结果更准确但 token 消耗多
+ */
+type ReasoningEffort = "low" | "medium" | "high";
+
+/**
+ * 推理强度别名映射
+ *
+ * 支持多种别名提高配置灵活性：mini/minimal → low
+ */
+const REASONING_EFFORT_ALIASES: Record<string, ReasoningEffort> = {
+  mini: "low",
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+};
+
+/**
+ * 推理模型识别规则
+ *
+ * 匹配以下模型系列，自动启用 reasoning_effort：
+ * - OpenAI o1/o3 系列、Codex、GPT-5（预留）
+ * - DeepSeek R1
+ * - 通义千问 QwQ
+ */
+const REASONING_MODEL_PATTERNS = [
+  /codex/i,
+  /\bgpt-5/i,
+  /\bo[1-9](?:-|$)/i,
+  /\bdeepseek-r1/i,
+  /\bqwq/i,
+];
+
+/**
+ * 解析模型名称中的推理强度指令
+ *
+ * 支持在模型名称后使用 @ 或 # 指定推理强度：
+ * - "o1@high" → 使用 high 推理强度
+ * - "o1#low" → 使用 low 推理强度
+ * - "o1" → 推理模型默认使用 medium，普通模型不设置
+ *
+ * @example
+ * parseModelDirective("o1@high")    // => { modelId: "o1", reasoningEffort: "high" }
+ * parseModelDirective("gpt-4o")     // => { modelId: "gpt-4o" }
+ * parseModelDirective("o1")         // => { modelId: "o1", reasoningEffort: "medium" }
+ */
+function parseModelDirective(model: string): {
+  modelId: string;
+  reasoningEffort?: ReasoningEffort;
+} {
+  const trimmed = model.trim();
+  if (!trimmed) return { modelId: model };
+
+  // 匹配 model@effort 或 model#effort 格式
+  const directiveMatch = trimmed.match(/^(.*?)[@#](mini|minimal|low|medium|high)$/i);
+  if (directiveMatch) {
+    const [, baseModel, effortKey] = directiveMatch;
+    return {
+      modelId: baseModel.trim() || trimmed,
+      reasoningEffort: REASONING_EFFORT_ALIASES[effortKey.toLowerCase()],
+    };
+  }
+
+  // 推理模型默认使用 medium
+  const isReasoningModel = REASONING_MODEL_PATTERNS.some((pattern) => pattern.test(trimmed));
+  if (isReasoningModel) {
+    return { modelId: trimmed, reasoningEffort: "medium" };
+  }
+
+  return { modelId: trimmed };
+}
+
+/* ============================================================================
+ * 请求定制工具
+ * ============================================================================ */
+
+/**
+ * 过滤 metadata 中与 SDK 冲突的保留字段
+ *
+ * model/prompt/messages/abortSignal 等字段由 SDK 内部管理，
+ * 用户自定义的 metadata 中如果包含这些字段会导致冲突
+ */
+function filterMetadata(
+  metadata: Record<string, unknown> | null | undefined
+): Record<string, unknown> | null {
+  if (!metadata) return null;
+
+  const filtered = Object.fromEntries(
+    Object.entries(metadata).filter(([key]) => !EXCLUDED_METADATA_KEYS.has(key))
+  );
+
+  return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+/**
+ * 创建自定义 fetch 函数
+ *
+ * 拦截 SDK 的 HTTP 请求，实现：
+ * 1. 注入自定义请求头（User-Agent、认证头等）
+ * 2. 将 metadata 合并到请求体中（用于传递额外参数）
+ *
+ * @param metadata - 要合并到请求体的额外参数
+ * @param headers - 要注入的自定义请求头
+ */
+function createCustomFetch(
+  endpoint: string,
+  metadata: Record<string, unknown> | null,
+  headers: Record<string, string>
+): typeof fetch {
+  return async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestInput = mergeEndpointQueryParams(input, endpoint);
+
+    // 使用 Headers API 确保用户 headers 完全覆盖 SDK headers
+    const mergedHeaders = new Headers(init?.headers);
+    for (const [key, value] of Object.entries(headers)) {
+      mergedHeaders.set(key, value); // set 会覆盖，append 会追加
+    }
+
+    // 非 POST 请求或无 body 时，仅注入 headers
+    if (init?.method?.toUpperCase() !== "POST" || !init.body) {
+      return fetch(requestInput, { ...init, headers: mergedHeaders });
+    }
+
+    // POST 请求：尝试将 metadata 合并到请求体
+    try {
+      const originalBody = typeof init.body === "string" ? JSON.parse(init.body) : init.body;
+      const mergedBody = metadata ? { ...originalBody, ...metadata } : originalBody;
+      return fetch(requestInput, {
+        ...init,
+        headers: mergedHeaders,
+        body: JSON.stringify(mergedBody),
+      });
+    } catch {
+      // JSON 解析失败时，仅注入 headers
+      return fetch(requestInput, { ...init, headers: mergedHeaders });
+    }
+  };
+}
+
+/* ============================================================================
+ * SDK 模型实例创建
+ * ============================================================================ */
+
+/** SDK selection depends only on the explicitly configured protocol. */
+function createModel(config: ProviderConfig) {
+  const endpoint = config.endpoint.trim();
+  const url = new URL(endpoint);
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("检测端点必须使用 HTTP 或 HTTPS");
+  }
+  const baseURL = deriveBaseURL(endpoint);
+  const { modelId, reasoningEffort } = parseModelDirective(config.model);
+  if (!modelId.trim()) throw new Error("检测模型不能为空");
+  const headers: Record<string, string> = {
+    "User-Agent": "model-pulse/0.1.0",
+    ...config.requestHeaders,
+  };
+  const customFetch = createCustomFetch(endpoint, filterMetadata(config.metadata), headers);
+
+  switch (config.protocol) {
+    case "openai_chat":
+    case "openai_responses": {
+      const provider = createOpenAI({ apiKey: config.apiKey, baseURL, fetch: customFetch });
+      return {
+        model: config.protocol === "openai_responses" ? provider.responses(modelId) : provider.chat(modelId),
+        reasoningEffort,
+      };
+    }
+    case "anthropic_messages": {
+      const provider = createAnthropic({ apiKey: config.apiKey, baseURL, fetch: customFetch });
+      return { model: provider(modelId), reasoningEffort: undefined };
+    }
+    case "gemini_native": {
+      // Strip a full method path for any host; query parameters are restored by customFetch.
+      url.search = "";
+      url.hash = "";
+      url.pathname = url.pathname.replace(/\/models\/[^/]+:(?:generateContent|streamGenerateContent)\/?$/, "");
+      const provider = createGoogle({ apiKey: config.apiKey, baseURL: url.toString().replace(/\/$/, ""), fetch: customFetch });
+      return { model: provider(modelId), reasoningEffort: undefined };
+    }
+    case "openai_compatible": {
+      const provider = createOpenAICompatible({ name: config.provider.id, apiKey: config.apiKey, baseURL, fetch: customFetch });
+      return { model: provider(modelId), reasoningEffort: undefined };
+    }
+    default:
+      throw new Error(`不支持的 API 协议: ${config.protocol}`);
+  }
+}
+
+/** AI SDK APICallError 类型定义（onError 回调与 catch 分支共用） */
+interface AIApiCallError extends Error {
+  statusCode?: number;
+  responseBody?: string;
+  lastError?: unknown;
+  errors?: unknown[];
+}
+
+/* ============================================================================
+ * think 块过滤
+ * ============================================================================ */
+
+/** 部分端点会把推理内容用这类标签混入文本流 */
+const THINK_TAGS = ["think", "thinking", "thought", "reasoning"] as const;
+
+/**
+ * 剥离文本中混入的 think 块
+ *
+ * 返回剥离后的正文与被剥离的 think 内容（后者作为答案的回退来源）。
+ * 处理三种形态：闭合块、流被截断导致的未闭合起始标签、以及缺失起始标签的孤立闭合标签
+ * （部分端点在服务端剥离起始标签，流里只剩 `</think>`）。
+ */
+function stripThinkBlocks(text: string): { content: string; think: string } {
+  let think = "";
+  let content = text;
+
+  const capture = (_match: string, inner: string): string => {
+    think += inner;
+    return "";
+  };
+
+  for (const tag of THINK_TAGS) {
+    // 1. 闭合块：<think>…</think>
+    content = content.replace(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "gi"), capture);
+    // 2. 孤立闭合标签（无起始标签）：`</think>` 之前全部视为 think 内容
+    content = content.replace(new RegExp(`^([\\s\\S]*?)</${tag}>`, "i"), capture);
+    // 3. 未闭合起始标签（流截断）：<think> 之后全部视为 think 内容
+    content = content.replace(new RegExp(`<${tag}>([\\s\\S]*)$`, "i"), capture);
+  }
+
+  return { content: content.trim(), think: think.trim() };
+}
+
+/* ============================================================================
+ * 检查结果构建
+ * ============================================================================ */
+
+/** 构建检查结果所需的基础参数 */
+interface ResultBuilderParams {
+  config: ProviderConfig;
+  endpoint: string;
+  pingLatencyMs: number | null;
+}
+
+/**
+ * 构建检查结果对象
+ *
+ * 统一的结果构建函数，确保所有返回路径的数据结构一致
+ */
+function buildCheckResult(
+  params: ResultBuilderParams,
+  status: HealthStatus | "validation_failed" | "failed" | "error",
+  latencyMs: number | null,
+  message: string,
+  logMessage?: string,
+  challengeOutcome?: ChallengeOutcome
+): CheckResult {
+  return {
+    id: params.config.id,
+    name: params.config.name,
+    provider: params.config.provider,
+    protocol: params.config.protocol,
+    endpoint: params.endpoint,
+    model: params.config.model,
+    status,
+    latencyMs,
+    pingLatencyMs: params.pingLatencyMs,
+    checkedAt: new Date().toISOString(),
+    message,
+    ...(logMessage ? { logMessage } : {}),
+    ...(challengeOutcome ? { challenge: challengeOutcome } : {}),
+    groupName: params.config.groupName || null,
+  };
+}
+
+/* ============================================================================
+ * 主检查函数
+ * ============================================================================ */
+
+/**
+ * 统一的 AI Provider 健康检查函数
+ *
+ * 执行流程：
+ * 1. 生成随机语言挑战（防止假站点用固定回复绕过）
+ * 2. 使用流式 API 发送请求，收集完整响应
+ * 3. 验证响应中是否包含正确答案
+ * 4. 根据延迟和验证结果判定健康状态
+ *
+ * 状态判定规则（延迟取首个非空 token 的时间）：
+ * - operational：请求成功、验证通过、延迟 ≤ 6000ms
+ * - degraded：请求成功、验证通过、延迟 > 6000ms
+ * - validation_failed：收到回复但难度 1/2 题答案验证失败
+ * - failed：请求失败、超时或回复为空
+ * - error：请求过程中发生异常
+ *
+ * 难度 3-5 的能力评估题答错不影响健康状态，仅记录到 check_challenges。
+ */
+export async function checkWithAiSdk(config: ProviderConfig): Promise<CheckResult> {
+  const startedAt = Date.now();
+
+  const displayEndpoint = config.endpoint.trim();
+  const pingPromise = measureEndpointPing(displayEndpoint);
+  const challenge = generateChallenge();
+
+  // 构建结果参数的辅助函数
+  const buildParams = async (): Promise<ResultBuilderParams> => ({
+    config,
+    endpoint: displayEndpoint,
+    pingLatencyMs: await pingPromise,
+  });
+
+  try {
+    const { model, reasoningEffort } = createModel(config);
+
+    // 捕获流处理过程中的错误
+    let streamError: AIApiCallError | null = null;
+
+    // 期望输出仅一个词：非推理模型锁死输出上限，省钱且防恶意端点猛吐输出刷成本。
+    // 推理模型的隐藏推理会占用输出预算，故不限制以免被饿死。
+    const result = streamText({
+      model,
+      prompt: challenge.prompt,
+      timeout: DEFAULT_TIMEOUT_MS,
+      ...(reasoningEffort ? { reasoning: reasoningEffort } : { maxOutputTokens: 24 }),
+      onError({ error }) {
+        streamError = error as AIApiCallError;
+      },
+    });
+
+    // 收集完整响应：遍历 fullStream 同时捕获文本与推理增量。
+    // 部分端点会先吐空流伪造首字延迟，这里以首个非空增量作为真实首字时间；
+    // 推理增量也参与采集，避免模型把最终答案放进 reasoning 导致"回复为空"误判。
+    let collectedResponse = "";
+    let collectedReasoning = "";
+    let firstTokenAt: number | null = null;
+    for await (const part of result.fullStream) {
+      let delta = "";
+      if (part.type === "text-delta") {
+        delta = part.text;
+        collectedResponse += delta;
+      } else if (part.type === "reasoning-delta") {
+        delta = part.text;
+        collectedReasoning += delta;
+      }
+      if (firstTokenAt === null && delta.trim()) {
+        firstTokenAt = Date.now();
+      }
+    }
+
+    // 首字延迟；流内没有任何非空增量时退化为整个流的耗时
+    const latencyMs = firstTokenAt === null ? Date.now() - startedAt : firstTokenAt - startedAt;
+    const params = await buildParams();
+
+    // 检查流处理过程中是否有错误
+    if (streamError) {
+      return buildCheckResult(
+        params,
+        "error",
+        latencyMs,
+        getErrorMessage(streamError),
+        getSanitizedErrorDetail(streamError)
+      );
+    }
+
+    // 空回复：文本与推理增量均为空才算未回复
+    if (!collectedResponse.trim() && !collectedReasoning.trim()) {
+      return buildCheckResult(params, "failed", latencyMs, "回复为空");
+    }
+
+    // 剥离混入文本流的 think 块，避免推理内容导致答案 token 数超标而误判
+    const { content: strippedResponse, think: strippedThink } = stripThinkBlocks(collectedResponse);
+
+    // 验证答案：优先剥离后的正文，其次剥离出的 think 内容，
+    // 再次推理增量（部分模型把答案错放进 reasoning）
+    const responseForValidation =
+      strippedResponse || strippedThink || collectedReasoning;
+    const { valid, normalized } = validateResponse(responseForValidation, challenge.expectedAnswer);
+
+    const challengeOutcome: ChallengeOutcome = {
+      difficulty: challenge.difficulty,
+      category: challenge.category,
+      expectedAnswer: challenge.expectedAnswer,
+      responseExcerpt: normalized,
+      passed: valid,
+    };
+
+    // 难度 1/2 答错视为故障（任何真 LLM 都应通过）；
+    // 难度 3-5 答错仅记录能力评估，不影响健康状态，避免弱模型健康抖动
+    if (!valid && challenge.difficulty <= 2) {
+      const actual = normalized || "(空)";
+      return buildCheckResult(
+        params,
+        "validation_failed",
+        latencyMs,
+        `回复验证失败: 期望 "${challenge.expectedAnswer}", 实际: "${actual}"`,
+        undefined,
+        challengeOutcome
+      );
+    }
+
+    // 判定健康状态
+    const status: HealthStatus = latencyMs <= DEGRADED_THRESHOLD_MS ? "operational" : "degraded";
+    // 高难度题（3-5）验证结果只落库到智能评估，不写入状态消息，避免面板出现噪音
+    const message =
+      status === "degraded"
+        ? `响应成功但耗时 ${latencyMs}ms`
+        : valid
+          ? `验证通过 (${latencyMs}ms)`
+          : `响应成功 (${latencyMs}ms)`;
+
+    return buildCheckResult(params, status, latencyMs, message, undefined, challengeOutcome);
+  } catch (error) {
+    const params = await buildParams();
+    return buildCheckResult(
+      params,
+      "error",
+      null,
+      getErrorMessage(error),
+      getSanitizedErrorDetail(error)
+    );
+  }
+}

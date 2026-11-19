@@ -1,0 +1,198 @@
+"use client";
+
+import {AlertTriangle, PauseCircle, Radio, Zap} from "lucide-react";
+
+import {ProviderIcon} from "@/components/provider-icon";
+import {StatusTimeline} from "@/components/status-timeline";
+import {AvailabilityStats} from "@/components/availability-stats";
+import {Badge} from "@/components/ui/badge";
+import {HoverCard, HoverCardContent, HoverCardTrigger} from "@/components/ui/hover-card";
+import type {AvailabilityPeriod, AvailabilityStat, IntelligenceStat, ProviderTimeline} from "@/lib/types";
+import {OFFICIAL_STATUS_META, STATUS_META} from "@/lib/core/status";
+import {cn} from "@/lib/utils";
+
+interface ProviderCardProps {
+  timeline: ProviderTimeline;
+  timeToNextRefresh: number | null;
+  availabilityStats?: AvailabilityStat[] | null;
+  intelligence?: IntelligenceStat | null;
+  selectedPeriod: AvailabilityPeriod;
+}
+
+const formatLatency = (value: number | null | undefined) =>
+  typeof value === "number" ? `${value} ms` : "—";
+
+const formatRate = (value: number | null | undefined) =>
+  typeof value === "number" ? `${value}%` : "—";
+
+const INTELLIGENCE_DIMENSIONS: Array<{ key: keyof IntelligenceStat; label: string }> = [
+  { key: "d1PassRate", label: "D1 分类选择" },
+  { key: "d2PassRate", label: "D2 阅读理解" },
+  { key: "d3PassRate", label: "D3 状态追踪" },
+  { key: "d4PassRate", label: "D4 逻辑蕴涵" },
+  { key: "d5PassRate", label: "D5 指令遵循" },
+];
+
+/** 智能评估得分 Tag：悬停展示各难度档通过率 */
+function IntelligenceTag({ intelligence }: { intelligence: IntelligenceStat }) {
+  if (intelligence.totalScore === null) {
+    return null;
+  }
+  const score = intelligence.totalScore;
+  const variant =
+    score >= 80 ? "default" : score >= 50 ? "secondary" : "destructive";
+
+  return (
+    <HoverCard openDelay={100}>
+      <HoverCardTrigger asChild>
+        <Badge variant={variant} className="shrink-0 cursor-default">
+          {score}
+        </Badge>
+      </HoverCardTrigger>
+      <HoverCardContent side="top" className="w-52 rounded-xl p-3">
+        <div className="grid gap-1.5 text-xs">
+          <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            智能评估 · 近 30 天各题型通过率
+          </p>
+          {INTELLIGENCE_DIMENSIONS.map((dim) => (
+            <div key={dim.key} className="flex items-center justify-between">
+              <span className="text-muted-foreground">{dim.label}</span>
+              <span className="font-mono font-medium">
+                {formatRate(intelligence[dim.key] as number | null)}
+              </span>
+            </div>
+          ))}
+          <div className="flex items-center justify-between border-t border-border/50 pt-1.5">
+            <span className="text-muted-foreground">样本数</span>
+            <span className="font-mono font-medium">{intelligence.totalSamples}</span>
+          </div>
+          <p className="text-[10px] leading-snug text-muted-foreground">
+            综合得分按难度加权（1/2/4/8/16）；难题答错仅影响得分，不影响健康状态
+          </p>
+        </div>
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
+
+export function ProviderCard({
+  timeline,
+  timeToNextRefresh,
+  availabilityStats,
+  intelligence,
+  selectedPeriod,
+}: ProviderCardProps) {
+  const { latest, items } = timeline;
+  const preset = STATUS_META[latest.status];
+  const isMaintenance = latest.status === "maintenance";
+  const officialStatus = latest.officialStatus;
+  const officialStatusMeta = officialStatus
+    ? OFFICIAL_STATUS_META[officialStatus.status]
+    : null;
+  const banner = officialStatusMeta?.bannerLabel ? officialStatusMeta : null;
+
+  return (
+    <div className={cn(
+      "relative flex flex-col overflow-hidden rounded-xl border bg-card transition-colors hover:border-foreground/20",
+      banner && banner.bannerBorder
+    )}>
+      {banner && officialStatus && (
+        <div className={cn(
+          "flex items-start gap-2.5 border-b px-4 py-2.5 sm:px-5 sm:py-3",
+          banner.bannerBg
+        )}>
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-bold sm:text-sm">
+              {banner.bannerLabel}
+            </p>
+            <p className="mt-0.5 text-[11px] leading-snug opacity-80 sm:text-xs">
+              {officialStatus.message || banner.description}
+            </p>
+            {officialStatus.affectedComponents && officialStatus.affectedComponents.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                {officialStatus.affectedComponents.map((c, i) => (
+                  <span key={`${c}-${i}`} className="rounded bg-current/10 px-1.5 py-0.5 text-[10px] font-medium">
+                    {c}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className={cn("flex-1 p-4 sm:p-5", banner && "opacity-60")}>
+        <div className="mb-4 flex items-center gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border bg-background">
+            <ProviderIcon provider={latest.provider} size={22} className="text-foreground/80" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <h3 className="truncate font-mono text-base font-semibold tracking-tight text-foreground">
+                {latest.model}
+              </h3>
+              {intelligence && <IntelligenceTag intelligence={intelligence} />}
+            </div>
+            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+              <span className="shrink-0 font-medium text-foreground/70">
+                {latest.provider.name}
+              </span>
+              <span className="truncate">{latest.name}</span>
+            </div>
+          </div>
+          <Badge
+            className={cn(
+              "shrink-0 whitespace-nowrap px-2 py-0.5 text-[10px] font-semibold sm:px-2.5 sm:text-xs",
+              preset.badgeClass
+            )}
+          >
+            {preset.label}
+          </Badge>
+        </div>
+
+        <div className="mb-4 grid grid-cols-2 gap-3">
+          <div className="rounded-lg bg-muted/50 p-3">
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <Zap className="h-3.5 w-3.5" />
+              <span className="text-[10px] font-semibold uppercase tracking-wider">对话延迟</span>
+            </div>
+            <div className="mt-1 font-mono text-lg font-medium leading-none text-foreground">
+              {formatLatency(latest.latencyMs)}
+            </div>
+          </div>
+
+          <div className="rounded-lg bg-muted/50 p-3">
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <Radio className="h-3.5 w-3.5" />
+              <span className="text-[10px] font-semibold uppercase tracking-wider">端点 PING</span>
+            </div>
+            <div className="mt-1 font-mono text-lg font-medium leading-none text-foreground">
+              {formatLatency(latest.pingLatencyMs)}
+            </div>
+          </div>
+        </div>
+
+        <div className="border-t pt-4">
+          <AvailabilityStats stats={availabilityStats} period={selectedPeriod} isMaintenance={isMaintenance} />
+        </div>
+      </div>
+
+      <div className="border-t px-4 py-3 sm:px-5">
+        <StatusTimeline items={items} nextRefreshInMs={timeToNextRefresh} isMaintenance={isMaintenance} />
+      </div>
+
+      {isMaintenance && (
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-card/85 px-6 text-center backdrop-blur-sm">
+          <PauseCircle className="h-8 w-8 text-blue-500" />
+          <p className="text-sm font-semibold text-foreground">
+            我们暂停对此模型探测
+          </p>
+          <p className="text-xs text-muted-foreground">
+            仅停止健康检查，不代表模型不可用
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}

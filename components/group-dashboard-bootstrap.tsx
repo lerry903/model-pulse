@@ -1,0 +1,113 @@
+"use client";
+
+import {useCallback, useEffect, useState, useSyncExternalStore} from "react";
+
+import {GroupDashboardView} from "@/components/group-dashboard-view";
+import {GroupDashboardSkeleton} from "@/components/dashboard-skeleton";
+import {STATUS_META} from "@/lib/core/status";
+import {fetchGroupWithCache, getGroupCache} from "@/lib/core/group-frontend-cache";
+import type {GroupDashboardData} from "@/lib/core/group-data";
+import type {AvailabilityPeriod} from "@/lib/types";
+import {cn} from "@/lib/utils";
+
+const DEFAULT_PERIOD: AvailabilityPeriod = "7d";
+const emptySubscribe = () => () => undefined;
+
+interface GroupDashboardBootstrapProps {
+  groupName: string;
+}
+
+export function GroupDashboardBootstrap({ groupName }: GroupDashboardBootstrapProps) {
+  const persisted = useSyncExternalStore(
+    emptySubscribe,
+    () => getGroupCache(groupName, DEFAULT_PERIOD)?.data ?? null,
+    () => null
+  );
+  const [data, setData] = useState<GroupDashboardData | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const viewData = data ?? persisted;
+
+  const loadData = useCallback(
+    async (forceFresh?: boolean) => {
+      try {
+        const result = await fetchGroupWithCache({
+          groupName,
+          trendPeriod: DEFAULT_PERIOD,
+          forceFresh,
+          revalidateIfFresh: true,
+          onBackgroundUpdate: (nextData) => {
+            setData(nextData);
+          },
+        });
+        setErrorMessage(null);
+        setData(result.data);
+      } catch (error) {
+        console.error("[model-pulse] 分组首屏加载失败", error);
+        setErrorMessage("数据加载失败，请稍后重试");
+      }
+    },
+    [groupName]
+  );
+
+  useEffect(() => {
+    let isActive = true;
+    const run = async () => {
+      try {
+        const result = await fetchGroupWithCache({
+          groupName,
+          trendPeriod: DEFAULT_PERIOD,
+          revalidateIfFresh: true,
+          onBackgroundUpdate: (nextData) => {
+            if (isActive) {
+              setData(nextData);
+            }
+          },
+        });
+        if (!isActive) {
+          return;
+        }
+        setErrorMessage(null);
+        setData(result.data);
+      } catch (error) {
+        if (!isActive) {
+          return;
+        }
+        console.error("[model-pulse] 分组首屏加载失败", error);
+        setErrorMessage("数据加载失败，请稍后重试");
+      }
+    };
+    run().catch(() => undefined);
+    return () => {
+      isActive = false;
+    };
+  }, [groupName]);
+
+  if (!viewData) {
+    return (
+      <div>
+        <GroupDashboardSkeleton />
+        {errorMessage && (
+          <div className="mt-6 flex justify-center">
+            <div
+              className={cn(
+                "inline-flex items-center gap-3 rounded-lg border px-4 py-2 text-sm",
+                STATUS_META.error.badgeClass
+              )}
+            >
+              <span>{errorMessage}</span>
+              <button
+                type="button"
+                onClick={() => loadData(true)}
+                className="rounded-md bg-foreground px-3 py-1 text-xs font-medium text-background transition-colors hover:bg-foreground/90"
+              >
+                重新加载
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return <GroupDashboardView groupName={groupName} initialData={viewData} />;
+}
